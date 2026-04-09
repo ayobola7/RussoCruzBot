@@ -4,27 +4,23 @@ RUSSO Trading Bot - Multi-Asset Telegram Bot
 Monitors 10 forex and metals pairs, sends signals to Telegram
 """
 
-import asyncio
+import os
 import logging
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
 import threading
 import time
 
-from database import Database
-from strategy import RussoStrategy
-from optimizer import GeneticOptimizer
-
 # ============================================
-# CONFIGURATION
+# CONFIGURATION - Get from environment variables
 # ============================================
 
-TELEGRAM_TOKEN = "8736985730:AAFh4vhgeL6_IXPN1IHmvJ_ErbIeSMGhT2U
-Kee"
-CHAT_ID = "688759657"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CHAT_ID = os.environ.get("CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 # Asset list
 ASSETS = [
@@ -46,7 +42,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-db = Database()
 monitoring_active = False
 monitor_task = None
 
@@ -54,53 +49,57 @@ monitor_task = None
 # SIGNAL GENERATION
 # ============================================
 
-def fetch_asset_data(symbol: str, yf_symbol: str) -> pd.DataFrame:
-    """Fetch latest data for an asset"""
+def check_asset_signal(asset: dict) -> dict:
+    """Simple signal check using MACD crossover"""
     try:
-        df = yf.download(yf_symbol, period='1d', interval='1m', progress=False)
+        df = yf.download(asset['yf_symbol'], period='1d', interval='5m', progress=False)
         
-        if df.empty:
-            logger.warning(f"No data for {symbol}")
+        if df.empty or len(df) < 50:
             return None
         
-        df.rename(columns={'Volume': 'volume'}, inplace=True)
-        if 'volume' not in df.columns:
-            df['volume'] = 1
+        # Calculate MACD
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
         
-        return df
-    except Exception as e:
-        logger.error(f"Error fetching {symbol}: {e}")
-        return None
-
-def check_asset_signal(asset: Dict) -> dict:
-    """Check for trading signal on a single asset"""
-    try:
-        df = fetch_asset_data(asset['symbol'], asset['yf_symbol'])
+        # Check for crossover
+        macd_prev = macd.iloc[-2]
+        macd_curr = macd.iloc[-1]
+        signal_prev = signal.iloc[-2]
+        signal_curr = signal.iloc[-1]
         
-        if df is None or df.empty:
-            return None
+        # Calculate RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = rsi.iloc[-1]
         
-        # Get optimized params for this asset
-        params = db.get_active_params(asset['symbol'])
-        strategy = RussoStrategy(params)
-        
-        df = strategy.calculate_indicators(df)
-        min_confidence = db.get_assets(active_only=True)
-        min_conf = next((a['min_confidence'] for a in min_confidence if a['symbol'] == asset['symbol']), 60)
-        
-        signal = strategy.get_signal(df, min_conf)
-        
-        if signal:
-            return {
-                'asset': asset['symbol'],
-                'asset_name': asset['name'],
-                'direction': signal['direction'],
-                'entry_price': signal['entry_price'],
-                'confidence': signal['confidence'],
-                'rsi': signal.get('rsi'),
-                'adx': signal.get('adx'),
-                'timestamp': datetime.now()
-            }
+        # Determine signal
+        if macd_curr > signal_curr and macd_prev <= signal_prev:
+            if current_rsi < 70:  # Avoid overbought
+                return {
+                    'asset': asset['symbol'],
+                    'asset_name': asset['name'],
+                    'direction': 'CALL',
+                    'entry_price': df['Close'].iloc[-1],
+                    'confidence': 70,
+                    'rsi': round(current_rsi, 1),
+                    'timestamp': datetime.now()
+                }
+        elif macd_curr < signal_curr and macd_prev >= signal_prev:
+            if current_rsi > 30:  # Avoid oversold
+                return {
+                    'asset': asset['symbol'],
+                    'asset_name': asset['name'],
+                    'direction': 'PUT',
+                    'entry_price': df['Close'].iloc[-1],
+                    'confidence': 70,
+                    'rsi': round(current_rsi, 1),
+                    'timestamp': datetime.now()
+                }
         
         return None
         
@@ -117,11 +116,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data='status'),
          InlineKeyboardButton("🎯 Check All", callback_data='check_all')],
-        [InlineKeyboardButton("⚙️ Optimize All", callback_data='optimize_all'),
-         InlineKeyboardButton("📈 Stats", callback_data='stats')],
         [InlineKeyboardButton("🔔 Monitor On", callback_data='monitor_on'),
-         InlineKeyboardButton("🔕 Monitor Off", callback_data='monitor_off')],
-        [InlineKeyboardButton("📋 Assets", callback_data='assets')]
+         InlineKeyboardButton("🔕 Monitor Off", callback_data='monitor_off')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -144,33 +140,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_status(query)
     elif query.data == 'check_all':
         await check_all_signals(query)
-    elif query.data == 'optimize_all':
-        await optimize_all(query, context)
-    elif query.data == 'stats':
-        await send_stats(query)
     elif query.data == 'monitor_on':
         await start_monitoring(query, context)
     elif query.data == 'monitor_off':
         await stop_monitoring(query)
-    elif query.data == 'assets':
-        await show_assets(query)
 
 async def send_status(query):
     """Send bot status"""
-    assets = db.get_assets()
-    active_count = sum(1 for a in assets if a['is_active'])
-    
-    # Get today's stats
-    today_stats = db.get_performance_stats(days=1)
-    
     status_msg = (
         "📊 *Bot Status*\n\n"
         f"🟢 Status: {'Monitoring' if monitoring_active else 'Idle'}\n"
-        f"📈 Active Assets: {active_count}/{len(assets)}\n"
-        f"📊 Today's Signals: {today_stats['total_signals']}\n"
-        f"✅ Today's Wins: {today_stats['wins']}\n"
-        f"📉 Today's Win Rate: {today_stats['win_rate']:.1f}%\n"
-        f"💰 Today's Profit: ${today_stats['total_profit']:.2f}\n\n"
+        f"📈 Active Assets: {len(ASSETS)}\n\n"
         "Use /check to scan all assets manually."
     )
     
@@ -181,10 +161,9 @@ async def check_all_signals(query):
     """Check all assets for signals"""
     await query.edit_message_text("🔍 Scanning all assets... Please wait.")
     
-    assets = db.get_assets(active_only=True)
     signals = []
     
-    for asset in assets:
+    for asset in ASSETS:
         signal = check_asset_signal(asset)
         if signal:
             signals.append(signal)
@@ -195,7 +174,7 @@ async def check_all_signals(query):
             emoji = "🟢" if s['direction'] == 'CALL' else "🔴"
             msg += f"{emoji} *{s['asset']}*: {s['direction']}\n"
             msg += f"   Price: {s['entry_price']:.5f} | Conf: {s['confidence']}%\n"
-            msg += f"   RSI: {s['rsi']} | ADX: {s['adx']}\n\n"
+            msg += f"   RSI: {s['rsi']}\n\n"
         
         msg += "💡 *Suggested Action:*\n"
         msg += "• Use 1-5 minute expiration\n"
@@ -203,19 +182,6 @@ async def check_all_signals(query):
         msg += "• Never risk more than 2% per trade"
         
         await query.edit_message_text(msg, parse_mode='Markdown')
-        
-        # Save signals to database
-        for s in signals:
-            db.save_signal({
-                'timestamp': s['timestamp'].isoformat(),
-                'asset': s['asset'],
-                'direction': s['direction'],
-                'entry_price': s['entry_price'],
-                'confidence': s['confidence'],
-                'rsi': s.get('rsi'),
-                'macd': None,
-                'volume_ratio': None
-            })
     else:
         await query.edit_message_text(
             "📭 *No Signals Found*\n\n"
@@ -225,104 +191,6 @@ async def check_all_signals(query):
         )
     
     await show_main_menu(query)
-
-async def optimize_all(query, context):
-    """Run optimization for all assets"""
-    await query.edit_message_text(
-        "🧬 *Starting Optimization*\n\n"
-        "This will optimize parameters for all 10 assets.\n"
-        "Estimated time: 10-15 minutes.\n\n"
-        "Progress will be reported here...",
-        parse_mode='Markdown'
-    )
-    
-    assets = db.get_assets()
-    results = []
-    
-    for i, asset in enumerate(assets):
-        await query.edit_message_text(
-            f"🔄 Optimizing {asset['symbol']}... ({i+1}/{len(assets)})\n"
-            f"Please wait...",
-            parse_mode='Markdown'
-        )
-        
-        try:
-            optimizer = GeneticOptimizer(asset['symbol'], period='1mo', interval='5m')
-            best_params, fitness, result = optimizer.run_optimization()
-            
-            db.save_optimized_params(asset['symbol'], best_params, fitness, 0, 0)
-            
-            results.append({
-                'asset': asset['symbol'],
-                'fitness': fitness,
-                'params': best_params
-            })
-            
-            await asyncio.sleep(2)  # Rate limiting
-            
-        except Exception as e:
-            results.append({'asset': asset['symbol'], 'error': str(e)})
-    
-    # Send summary
-    summary = "✅ *Optimization Complete*\n\n"
-    for r in results:
-        if 'error' in r:
-            summary += f"❌ {r['asset']}: Failed - {r['error']}\n"
-        else:
-            summary += f"✅ {r['asset']}: Fitness {r['fitness']:.1f}\n"
-    
-    await query.edit_message_text(summary, parse_mode='Markdown')
-    await show_main_menu(query)
-
-async def send_stats(query):
-    """Send performance statistics"""
-    assets = db.get_assets()
-    stats_msg = "📈 *30-Day Performance*\n\n"
-    
-    for asset in assets:
-        stats = db.get_performance_stats(asset['symbol'], days=30)
-        if stats['total_signals'] > 0:
-            emoji = "🟢" if stats['win_rate'] >= 55 else ("🟡" if stats['win_rate'] >= 45 else "🔴")
-            stats_msg += f"{emoji} *{asset['symbol']}*: {stats['win_rate']:.1f}% ({stats['wins']}/{stats['total_signals']})\n"
-            stats_msg += f"   Profit: ${stats['total_profit']:.2f} | Conf: {stats['avg_confidence']:.0f}%\n"
-    
-    await query.edit_message_text(stats_msg, parse_mode='Markdown')
-    await show_main_menu(query)
-
-async def show_assets(query):
-    """Show asset list with toggles"""
-    assets = db.get_assets(active_only=False)
-    
-    keyboard = []
-    for asset in assets:
-        status = "✅" if asset['is_active'] else "❌"
-        keyboard.append([InlineKeyboardButton(
-            f"{status} {asset['symbol']} - {asset['name']}",
-            callback_data=f"toggle_{asset['symbol']}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='status')])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "📋 *Assets*\n\nTap to toggle monitoring:",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-
-async def toggle_asset_from_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle asset from menu"""
-    query = update.callback_query
-    symbol = query.data.replace('toggle_', '')
-    
-    assets = db.get_assets(active_only=False)
-    asset = next((a for a in assets if a['symbol'] == symbol), None)
-    
-    if asset:
-        new_status = 0 if asset['is_active'] else 1
-        db.update_asset_status(symbol, new_status)
-        await query.answer(f"{symbol} {'activated' if new_status else 'deactivated'}")
-        await show_assets(query)
 
 async def start_monitoring(query, context):
     """Start automatic monitoring"""
@@ -372,13 +240,11 @@ async def monitor_loop(context: ContextTypes.DEFAULT_TYPE):
     
     while monitoring_active:
         try:
-            assets = db.get_assets(active_only=True)
-            
-            for asset in assets:
+            for asset in ASSETS:
                 signal = check_asset_signal(asset)
                 
                 if signal:
-                    # Avoid duplicate alerts (same asset, same direction within 10 minutes)
+                    # Avoid duplicate alerts (same asset within 10 minutes)
                     key = f"{asset['symbol']}_{signal['direction']}"
                     if key in last_signals:
                         time_diff = (datetime.now() - last_signals[key]).total_seconds()
@@ -395,24 +261,11 @@ async def monitor_loop(context: ContextTypes.DEFAULT_TYPE):
                         f"🎯 *Direction:* {signal['direction']}\n"
                         f"💰 *Entry:* {signal['entry_price']:.5f}\n"
                         f"📊 *Confidence:* {signal['confidence']}%\n"
-                        f"📉 *RSI:* {signal['rsi']} | *ADX:* {signal['adx']}\n\n"
-                        f"⏰ *Time:* {signal['timestamp'].strftime('%H:%M:%S')}\n\n"
+                        f"📉 *RSI:* {signal['rsi']}\n\n"
                         f"💡 Consider a 1-5 minute trade"
                     )
                     
                     await context.bot.send_message(chat_id=CHAT_ID, text=alert_msg, parse_mode='Markdown')
-                    
-                    # Save to database
-                    db.save_signal({
-                        'timestamp': signal['timestamp'].isoformat(),
-                        'asset': signal['asset'],
-                        'direction': signal['direction'],
-                        'entry_price': signal['entry_price'],
-                        'confidence': signal['confidence'],
-                        'rsi': signal.get('rsi'),
-                        'macd': None,
-                        'volume_ratio': None
-                    })
             
             await asyncio.sleep(300)  # Check every 5 minutes
             
@@ -427,11 +280,8 @@ async def show_main_menu(query):
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data='status'),
          InlineKeyboardButton("🎯 Check All", callback_data='check_all')],
-        [InlineKeyboardButton("⚙️ Optimize All", callback_data='optimize_all'),
-         InlineKeyboardButton("📈 Stats", callback_data='stats')],
         [InlineKeyboardButton("🔔 Monitor On", callback_data='monitor_on'),
-         InlineKeyboardButton("🔕 Monitor Off", callback_data='monitor_off')],
-        [InlineKeyboardButton("📋 Assets", callback_data='assets')]
+         InlineKeyboardButton("🔕 Monitor Off", callback_data='monitor_off')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -443,12 +293,16 @@ async def show_main_menu(query):
 
 def main():
     """Main entry point"""
+    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE" or CHAT_ID == "YOUR_CHAT_ID_HERE":
+        print("ERROR: Please set TELEGRAM_TOKEN and CHAT_ID environment variables")
+        print("On Render: Go to Environment tab and add these variables")
+        return
+    
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(toggle_asset_from_menu, pattern='^toggle_'))
     
     logger.info("Bot started! Monitoring 10 assets...")
     
